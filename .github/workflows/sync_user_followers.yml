@@ -1,0 +1,135 @@
+name: Sync user_followers → Notion
+
+on:
+  schedule:
+    - cron: "0 15 * * *"   # 11:00 in New York during EDT (UTC-4)
+    - cron: "0 16 * * *"   # 11:00 in New York during EST (UTC-5)
+  workflow_dispatch:
+    inputs:
+      chunk_offset:
+        description: "Start offset"
+        required: false
+        default: "0"
+      max_rows:
+        description: "Max rows per run"
+        required: false
+        default: "1200"
+      max_minutes:
+        description: "Max minutes per run"
+        required: false
+        default: "110"
+      chunk_size:
+        description: "Rows per page (SQL LIMIT)"
+        required: false
+        default: "800"
+      rate_delay:
+        description: "Seconds between Notion writes"
+        required: false
+        default: "0.20"
+      username_filter:
+        description: "Optional username filter (e.g., aoTheComputer)"
+        required: false
+        default: ""
+      lookback_hours:
+        description: "Lookback window in hours (applies to snapshot_time)"
+        required: false
+        default: "17532"   # ~2 years
+      order_dir:
+        description: "Order by snapshot_time (ASC or DESC)"
+        required: false
+        default: "ASC"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.3.3"
+          use-public-rspm: true
+
+      - name: Install system libraries (for RPostgres/curl)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev libcurl4-openssl-dev libssl-dev
+
+      - name: Ensure GitHub CLI is installed
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+
+      - id: nytime
+        name: Get New York hour
+        run: echo "hour=$(TZ=America/New_York date +%H)" >> $GITHUB_OUTPUT
+
+      # ✅ Preflight: verify Notion credentials and DB access before running R
+      - name: Preflight – Notion auth check
+        run: |
+          set -e
+          echo "Checking /v1/databases/${NOTION_DATABASE_ID}…"
+          code=$(curl -s -o /tmp/notion.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${NOTION_TOKEN}" \
+            -H "Notion-Version: 2022-06-28" \
+            https://api.notion.com/v1/databases/${NOTION_DATABASE_ID})
+          echo "HTTP ${code}"
+          if [ "$code" != "200" ]; then
+            echo "::error title=Notion API failed::See payload below (most fields redacted)."
+            sed -E 's/"access_token":"[^"]+"/"access_token":"***"/g' /tmp/notion.json | head -200
+            exit 1
+          fi
+          echo "✅ Notion DB schema fetch OK."
+        env:
+          NOTION_TOKEN:        ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID:  ${{ secrets.NOTION_DATABASE_ID }}
+
+      - id: run
+        name: Run sync (user_followers → Notion)
+        if: ${{ github.event_name != 'schedule' || steps.nytime.outputs.hour == '11' }}
+        env:
+          # Notion
+          NOTION_TOKEN:        ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID:  ${{ secrets.NOTION_DATABASE_ID }}
+          # Supabase / Postgres
+          SUPABASE_HOST:       ${{ secrets.SUPABASE_HOST }}
+          SUPABASE_USER:       ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PWD:        ${{ secrets.SUPABASE_PWD }}
+          SUPABASE_DB:         ${{ secrets.SUPABASE_DB }}
+          SUPABASE_PORT:       ${{ secrets.SUPABASE_PORT }}
+          # Controls
+          LOOKBACK_HOURS:      ${{ inputs.lookback_hours || '17532' }}
+          CHUNK_OFFSET:        ${{ inputs.chunk_offset   || '0' }}
+          MAX_ROWS_PER_RUN:    ${{ inputs.max_rows       || '1200' }}
+          MAX_MINUTES:         ${{ inputs.max_minutes    || '110' }}
+          CHUNK_SIZE:          ${{ inputs.chunk_size     || '800' }}
+          RATE_DELAY_SEC:      ${{ inputs.rate_delay     || '0.20' }}
+          USERNAME_FILTER:     ${{ inputs.username_filter || '' }}
+          ORDER_DIR:           ${{ inputs.order_dir       || 'ASC' }}
+        run: Rscript notion_sync_user_followers.R
+
+      - name: Auto-continue next chunk
+        if: ${{ steps.run.outputs.next_offset && steps.run.outputs.next_offset != 'done' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Queuing next run from offset ${{ steps.run.outputs.next_offset }}..."
+          gh workflow run "${{ github.workflow }}" \
+            -f chunk_offset=${{ steps.run.outputs.next_offset }} \
+            -f max_rows=${{ inputs.max_rows || '1200' }} \
+            -f max_minutes=${{ inputs.max_minutes || '110' }} \
+            -f chunk_size=${{ inputs.chunk_size || '800' }} \
+            -f rate_delay=${{ inputs.rate_delay || '0.20' }} \
+            -f username_filter="${{ inputs.username_filter || '' }}" \
+            -f lookback_hours=${{ inputs.lookback_hours || '17532' }} \
+            -f order_dir=${{ inputs.order_dir || 'ASC' }}
