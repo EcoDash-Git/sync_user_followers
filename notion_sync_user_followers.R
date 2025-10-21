@@ -22,7 +22,7 @@ NUM_NA_AS_ZERO     <- tolower(Sys.getenv("NUM_NA_AS_ZERO","false")) %in% c("1","
 INSPECT_FIRST_ROW  <- tolower(Sys.getenv("INSPECT_FIRST_ROW","false")) %in% c("1","true","yes")
 DUMP_SCHEMA        <- tolower(Sys.getenv("DUMP_SCHEMA","false"))       %in% c("1","true","yes")
 RATE_DELAY_SEC     <- as.numeric(Sys.getenv("RATE_DELAY_SEC","0.20"))
-RUN_SMOKE_TEST     <- tolower(Sys.getenv("RUN_SMOKE_TEST","false"))    %in% c("1","true","yes"))
+RUN_SMOKE_TEST     <- tolower(Sys.getenv("RUN_SMOKE_TEST","false"))    %in% c("1","true","yes")
 
 CHUNK_SIZE         <- as.integer(Sys.getenv("CHUNK_SIZE","800"))
 CHUNK_OFFSET       <- as.integer(Sys.getenv("CHUNK_OFFSET","0"))
@@ -407,3 +407,4 @@ message(sprintf("All pages done. Upserts ok: %d. Expected distinct under filter:
 # Tell the workflow we’re finished (for auto-continue step)
 go <- Sys.getenv("GITHUB_OUTPUT")
 if (nzchar(go)) write("next_offset=done", file = go, append = TRUE)
+
