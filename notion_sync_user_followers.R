@@ -3,7 +3,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Supabase (Postgres) → Notion (paged, lazy preindex, SQL de-dupe, resumable)
 # Source table: user_followers
-# Unique row key (for Notion Title): "{user_id} • {snapshot_time in UTC ISO}"
+# Unique Notion Title: "{user_id} • {snapshot_time in UTC ISO}"
+# Optional full overwrite: set OVERWRITE_NOTION=true (archives all pages first)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # --- packages ----------------------------------------------------------------
@@ -23,6 +24,7 @@ INSPECT_FIRST_ROW  <- tolower(Sys.getenv("INSPECT_FIRST_ROW","false")) %in% c("1
 DUMP_SCHEMA        <- tolower(Sys.getenv("DUMP_SCHEMA","false"))       %in% c("1","true","yes")
 RATE_DELAY_SEC     <- as.numeric(Sys.getenv("RATE_DELAY_SEC","0.20"))
 RUN_SMOKE_TEST     <- tolower(Sys.getenv("RUN_SMOKE_TEST","false"))    %in% c("1","true","yes")
+OVERWRITE_NOTION   <- tolower(Sys.getenv("OVERWRITE_NOTION","false"))  %in% c("1","true","yes")
 
 CHUNK_SIZE         <- as.integer(Sys.getenv("CHUNK_SIZE","800"))
 CHUNK_OFFSET       <- as.integer(Sys.getenv("CHUNK_OFFSET","0"))
@@ -30,7 +32,7 @@ USERNAME_FILTER    <- Sys.getenv("USERNAME_FILTER","")                 # optiona
 ORDER_DIR          <- toupper(Sys.getenv("ORDER_DIR","ASC"))           # time-series = ASC by default
 if (!(ORDER_DIR %in% c("ASC","DESC"))) ORDER_DIR <- "ASC"
 
-# Resumability budgets (stop early; workflow will auto-continue)
+# Resumability budgets
 MAX_ROWS_PER_RUN   <- as.integer(Sys.getenv("MAX_ROWS_PER_RUN","1200"))
 MAX_MINUTES        <- as.numeric(Sys.getenv("MAX_MINUTES","110"))
 t0 <- Sys.time()
@@ -81,7 +83,7 @@ perform <- function(req, tag = "", max_tries = 6, base_sleep = 0.5) {
     tag = tag,
     status = if (inherits(last, "httr2_response")) last$status_code else NA_integer_,
     body = if (inherits(last, "httr2_response")) tryCatch(resp_body_string(last), error = function(...) "<no body>")
-    else paste("R error:", conditionMessage(last))
+           else paste("R error:", conditionMessage(last))
   )
   structure(list(.err = TRUE, err = err), class = "notion_err")
 }
@@ -147,6 +149,48 @@ set_prop <- function(name, value) {
   } else NULL
 }
 
+# --- Overwrite helpers (archive all pages) -----------------------------------
+archive_page <- function(page_id) {
+  resp <- notion_req(paste0("https://api.notion.com/v1/pages/", page_id)) |>
+    req_method("PATCH") |>
+    req_body_json(list(archived = TRUE), auto_unbox = TRUE) |>
+    perform(tag = "ARCHIVE /pages/:id")
+  !is_err(resp)
+}
+
+archive_all_pages_in_db <- function(db_id, delay = RATE_DELAY_SEC) {
+  message("🧹 Overwrite requested — archiving all existing pages in Notion DB before sync …")
+  has_more <- TRUE
+  start_cursor <- NULL
+  total_archived <- 0L
+
+  while (has_more) {
+    body <- list(page_size = 100L)
+    if (!is.null(start_cursor)) body$start_cursor <- start_cursor
+
+    resp <- notion_req(paste0("https://api.notion.com/v1/databases/", db_id, "/query")) |>
+      req_body_json(body, auto_unbox = TRUE) |>
+      perform(tag="POST /databases/query (overwrite pass)")
+    if (is_err(resp)) { show_err(resp); break }
+
+    out <- resp_body_json(resp, simplifyVector = FALSE)
+    res <- out$results %||% list()
+    if (!length(res)) { has_more <- FALSE; break }
+
+    for (pg in res) {
+      pid <- pg$id
+      ok <- archive_page(pid)
+      if (ok) total_archived <- total_archived + 1L
+      Sys.sleep(delay)
+    }
+
+    has_more <- isTRUE(out$has_more %||% FALSE)
+    start_cursor <- out$next_cursor %||% NULL
+  }
+
+  message(sprintf("🧹 Archived %d pages.", total_archived))
+}
+
 # Build Title and properties from a DB row
 title_from_row <- function(r) {
   # Title = "{user_id} • {snapshot_time UTC ISO}"
@@ -160,7 +204,7 @@ props_from_row <- function(r) {
   pr <- list()
   ttl <- title_from_row(r)
   pr[[TITLE_PROP]] <- set_prop(TITLE_PROP, ttl)
-  
+
   wanted <- c("user_id","username","followers_count","snapshot_time")
   for (nm in wanted) {
     if (!is.null(PROPS[[nm]]) && !is.null(r[[nm]])) pr[[nm]] <- set_prop(nm, r[[nm]])
@@ -179,15 +223,12 @@ find_page_by_title_eq <- function(val) {
   if (length(out$results)) out$results$id[1] else NA_character_
 }
 
-# --- LAZY index for this chunk (by Title only, since it's composite+unique) ---
+# --- LAZY index for this chunk (by Title) ------------------------------------
 build_index_for_rows <- function(rows) {
   by_ttl <- new.env(parent=emptyenv())
-  
-  # Gather candidate titles for this chunk
   titles <- vapply(seq_len(nrow(rows)), function(i) title_from_row(rows[i, , drop=FALSE]), character(1L))
   titles <- unique(titles[nzchar(titles)])
-  
-  # Query in batches
+
   i <- 1L
   while (i <= length(titles)) {
     slice <- titles[i:min(i+49, length(titles))]
@@ -208,7 +249,7 @@ build_index_for_rows <- function(rows) {
     i <- i + 50L
     Sys.sleep(RATE_DELAY_SEC/2)
   }
-  
+
   list(by_title = by_ttl)
 }
 
@@ -234,23 +275,22 @@ update_page <- function(page_id, pr) {
 upsert_row <- function(r, idx = NULL) {
   title_val <- title_from_row(r)
   pr_full   <- props_from_row(r)
-  
+
   pid <- NA_character_
   if (!is.null(idx)) {
     pid <- idx$by_title[[title_val]]; if (is.null(pid)) pid <- NA_character_
   } else {
     pid <- find_page_by_title_eq(title_val)
   }
-  
+
   if (!is.na(pid[1])) {
     ok <- update_page(pid, pr_full)
     return(is.logical(ok) && ok)
   }
-  
+
   pid2 <- create_page(pr_full)
   if (!is.na(pid2[1])) return(TRUE)
-  
-  # Fallback: create minimal, then patch
+
   pr_min <- list(); pr_min[[TITLE_PROP]] <- set_prop(TITLE_PROP, title_val)
   pid3 <- create_page(pr_min)
   if (is.na(pid3[1])) return(FALSE)
@@ -273,6 +313,11 @@ con <- DBI::dbConnect(
   password = supa_pwd,
   sslmode = "require"
 )
+
+# Optional full overwrite (only on first chunk)
+if (OVERWRITE_NOTION && CHUNK_OFFSET == 0) {
+  archive_all_pages_in_db(DB_ID, delay = RATE_DELAY_SEC)
+}
 
 # Lookback window applies to snapshot_time
 since <- as.POSIXct(Sys.time(), tz = "UTC") - LOOKBACK_HOURS * 3600
@@ -359,17 +404,16 @@ repeat {
     ORDER BY snapshot_time %s
     LIMIT %d OFFSET %d
   ", base_where, user_clause, ORDER_DIR, CHUNK_SIZE, offset)
-  
+
   rows <- DBI::dbGetQuery(con, qry)
   n <- nrow(rows)
   if (!n) break
-  
+
   message(sprintf("Fetched %d rows (offset=%d). USERNAME_FILTER=%s CHUNK_SIZE=%d",
                   n, offset, ifelse(nzchar(USERNAME_FILTER), USERNAME_FILTER, "<none>"), CHUNK_SIZE))
-  
-  # Build a mini Notion index by Title for these rows
+
   idx <- build_index_for_rows(rows)
-  
+
   success <- 0L
   for (i in seq_len(n)) {
     r <- rows[i, , drop = FALSE]
@@ -381,15 +425,14 @@ repeat {
     if (i %% 50 == 0) message(sprintf("Processed %d/%d in this page (ok %d)", i, n, success))
     Sys.sleep(RATE_DELAY_SEC)
   }
-  
+
   total_success <- total_success + success
   total_seen    <- total_seen + n
   offset        <- offset + n
-  
+
   message(sprintf("Page done. %d/%d upserts ok (cumulative ok %d, seen %d of ~%d).",
                   success, n, total_success, total_seen, expected_i))
-  
-  # --- stop early to avoid hard timeout & chain next run
+
   elapsed_min <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
   if (total_seen >= MAX_ROWS_PER_RUN || elapsed_min >= MAX_MINUTES) {
     message(sprintf("Stopping early (seen=%d, elapsed=%.1f min). Next offset = %d",
@@ -407,4 +450,3 @@ message(sprintf("All pages done. Upserts ok: %d. Expected distinct under filter:
 # Tell the workflow we’re finished (for auto-continue step)
 go <- Sys.getenv("GITHUB_OUTPUT")
 if (nzchar(go)) write("next_offset=done", file = go, append = TRUE)
-
